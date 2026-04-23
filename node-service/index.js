@@ -106,6 +106,11 @@ async function connectToWhatsApp(deviceUuid) {
         browser: ["GaweGateway", "Chrome", "1.0.0"],
         // Keepalive bawaan Baileys - otomatis ping ke server WA
         keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0,
+        // Nonaktifkan sinkronisasi pesan lama/history untuk menghemat bandwidth & RAM
+        syncFullHistory: false,
+        shouldSyncHistoryMessage: () => false,
     });
 
     sessions.set(deviceUuid, sock);
@@ -217,7 +222,12 @@ async function connectToWhatsApp(deviceUuid) {
         }
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+        // Hanya simpan jika folder masih ada (hindari ENOENT jika logout sedang diproses)
+        if (fs.existsSync(sessionPath)) {
+            await saveCreds();
+        }
+    });
 
     // ---- Pesan masuk ----
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -342,6 +352,15 @@ app.post('/messages/send', async (req, res) => {
         res.json({ success: true, result });
     } catch (err) {
         console.error(`[${device_uuid}] Gagal kirim pesan:`, err.message);
+        
+        // Jika error connection closed, bisa jadi socket sedang reconnecting
+        if (err.message.includes('Connection Closed')) {
+            return res.status(503).json({ 
+                error: 'Connection is closed. Please wait a moment for reconnection or refresh the page.',
+                retry_after: 5
+            });
+        }
+        
         res.status(500).json({ error: err.message });
     }
 });
@@ -375,8 +394,9 @@ app.get('/sessions/:uuid', (req, res) => {
 
     res.json({
         status: 'active',
-        connected: sock.user ? true : false,
-        phone: sock.user?.id?.split(':')[0] || null
+        connected: (sock.user && sock.ws?.readyState === 1) ? true : false,
+        phone: sock.user?.id?.split(':')[0] || null,
+        ws_state: sock.ws?.readyState
     });
 });
 
@@ -424,10 +444,12 @@ async function gracefulShutdown(signal) {
     const closePromises = [];
     sessions.forEach((sock, uuid) => {
         console.log(`[System] Menutup session: ${uuid}`);
-        closePromises.push(
-            sock.end(new Error('Server shutdown'))
-                .catch(err => console.error(`[System] Error menutup ${uuid}: ${err.message}`))
-        );
+        if (sock && typeof sock.end === 'function') {
+            closePromises.push(
+                Promise.resolve(sock.end(new Error('Server shutdown')))
+                    .catch(err => console.error(`[System] Error menutup ${uuid}: ${err.message}`))
+            );
+        }
     });
 
     await Promise.allSettled(closePromises);
